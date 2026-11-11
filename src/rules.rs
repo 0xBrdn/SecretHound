@@ -32,7 +32,7 @@ pub fn get_rules() -> &'static [SecretRule] {
                 name: "aws-secret-access-key",
                 description: "AWS Secret Access Key",
                 regex: Regex::new(
-                    r"(?i)(?:aws)?[_\-\s]?(?:secret)?[_\-\s]?(?:access)?[_\-\s]?key[_\-\s]*(?:=|:)\s*['\"]?([A-Za-z0-9/+=]{40})['\"]?",
+                    r#"(?i)(?:aws)?[_\-\s]?(?:secret)?[_\-\s]?(?:access)?[_\-\s]?key[_\-\s]*(?:=|:)\s*['"]?([A-Za-z0-9/+=]{40})['"]?"#,
                 )
                 .expect("invalid AWS Secret Access Key regex"),
             },

@@ -6,7 +6,6 @@ mod scanner;
 
 use clap::{Parser, Subcommand};
 use colored::Colorize;
-use comfy_table::presets::UTF8_ROUNDED;
 use comfy_table::{Attribute, Cell, Color, ContentArrangement, Table};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -39,7 +38,6 @@ enum Commands {
 fn print_findings_table(findings: &[scanner::Finding]) {
     let mut table = Table::new();
     table
-        .load_preset(UTF8_ROUNDED)
         .set_content_arrangement(ContentArrangement::Dynamic)
         .set_header(vec![
             Cell::new("File")
@@ -123,7 +121,7 @@ fn install_hook() -> Result<(), String> {
 set -e
 
 echo "▸ SecretHound · pre-commit scan…"
-"{exe}" scan .
+"{exe_str}" scan .
 
 "#
     );
