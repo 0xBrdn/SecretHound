@@ -1,6 +1,8 @@
 //! SecretHound - Ultra-fast static secrets scanner
 //! Author: 0xBrdn
 
+mod rules;
+
 use clap::{Parser, Subcommand};
 use colored::Colorize;
 use std::path::PathBuf;
@@ -30,12 +32,16 @@ enum Commands {
 fn main() {
     let cli = Cli::parse();
 
+    // Rules are compiled once via OnceLock
+    let rules = rules::get_rules();
+
     match cli.command {
         Commands::Scan { path } => {
             println!(
-                "{} Scanning path: {}",
+                "{} Scanning path: {} ({} rules loaded)",
                 "[DEBUG]".yellow().bold(),
-                path.display().to_string().cyan()
+                path.display().to_string().cyan(),
+                rules.len().to_string().green()
             );
         }
         Commands::InstallHook => {
