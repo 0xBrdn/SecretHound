@@ -6,6 +6,8 @@ mod scanner;
 
 use clap::{Parser, Subcommand};
 use colored::Colorize;
+use comfy_table::presets::UTF8_ROUNDED;
+use comfy_table::{Attribute, Cell, Color, ContentArrangement, Table};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -30,34 +32,68 @@ enum Commands {
     InstallHook,
 }
 
+fn print_findings_table(findings: &[scanner::Finding]) {
+    let mut table = Table::new();
+    table
+        .load_preset(UTF8_ROUNDED)
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header(vec![
+            Cell::new("File")
+                .add_attribute(Attribute::Bold)
+                .fg(Color::Cyan),
+            Cell::new("Line")
+                .add_attribute(Attribute::Bold)
+                .fg(Color::Cyan),
+            Cell::new("Type")
+                .add_attribute(Attribute::Bold)
+                .fg(Color::Cyan),
+            Cell::new("Secret (Obfuscated)")
+                .add_attribute(Attribute::Bold)
+                .fg(Color::Cyan),
+        ]);
+
+    for f in findings {
+        table.add_row(vec![
+            Cell::new(f.file.display().to_string()),
+            Cell::new(f.line.to_string()),
+            Cell::new(f.rule_name).fg(Color::Yellow),
+            Cell::new(&f.secret_obfuscated).fg(Color::DarkGrey),
+        ]);
+    }
+
+    println!();
+    println!("{}", table);
+    println!();
+    println!(
+        "{} {} secret(s) detected. Review carefully before committing.",
+        "⚠".red().bold(),
+        findings.len().to_string().red().bold()
+    );
+}
+
 fn main() {
     let cli = Cli::parse();
 
     match cli.command {
         Commands::Scan { path } => {
+            println!();
             println!(
-                "{} Scanning path: {}",
-                "[DEBUG]".yellow().bold(),
-                path.display().to_string().cyan()
+                "{}  SecretHound · scanning {}",
+                "▸".cyan().bold(),
+                path.display().to_string().bold()
             );
+            println!();
 
             let findings = scanner::scan(&path);
 
-            println!(
-                "{} Found {} potential secret(s)",
-                "[DEBUG]".yellow().bold(),
-                findings.len().to_string().green()
-            );
-
-            for f in &findings {
+            if findings.is_empty() {
                 println!(
-                    "  {} {}:{}  [{}]  {}",
-                    "→".red(),
-                    f.file.display(),
-                    f.line,
-                    f.rule_name.yellow(),
-                    f.secret_obfuscated.bright_black()
+                    "{}  No secrets found. Repository looks clean.",
+                    "✔".green().bold()
                 );
+                println!();
+            } else {
+                print_findings_table(&findings);
             }
         }
         Commands::InstallHook => {

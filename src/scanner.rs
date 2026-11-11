@@ -3,10 +3,12 @@
 
 use crate::rules::{get_rules, SecretRule};
 use ignore::WalkBuilder;
+use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// A single secret finding.
 #[derive(Debug, Clone)]
@@ -27,7 +29,6 @@ fn obfuscate(secret: &str) -> String {
     let len = chars.len();
 
     if len <= 8 {
-        // Too short: mask everything except first char
         if len == 0 {
             return String::new();
         }
@@ -42,7 +43,6 @@ fn obfuscate(secret: &str) -> String {
 
 /// Returns true if the path looks like a binary we should skip.
 fn is_likely_binary(path: &Path) -> bool {
-    // Quick extension-based filter (common binaries / media)
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
         let ext = ext.to_lowercase();
         matches!(
@@ -77,20 +77,15 @@ fn scan_file(path: &Path, rules: &[SecretRule]) -> Vec<Finding> {
         let line_no = idx + 1;
         let line = match line_result {
             Ok(l) => l,
-            Err(_) => {
-                // Non-UTF-8 line → treat whole file as binary-ish and stop
-                return findings;
-            }
+            Err(_) => return findings, // non-UTF-8 → stop this file
         };
 
-        // Skip extremely long lines (likely minified / generated)
         if line.len() > 10_000 {
             continue;
         }
 
         for rule in rules {
             for cap in rule.regex.captures_iter(&line) {
-                // Prefer the first capture group if present, otherwise the whole match
                 let secret = if let Some(m) = cap.get(1) {
                     m.as_str()
                 } else if let Some(m) = cap.get(0) {
@@ -116,15 +111,15 @@ fn scan_file(path: &Path, rules: &[SecretRule]) -> Vec<Finding> {
     findings
 }
 
-/// Walk `root` with the `ignore` crate (respects .gitignore) then scan in parallel.
+/// Walk `root` with the `ignore` crate then scan in parallel with a live progress bar.
 pub fn scan(root: &Path) -> Vec<Finding> {
     let rules = get_rules();
 
-    // Collect candidate files (respecting .gitignore / .ignore / hidden, etc.)
+    // Collect candidate files (respects .gitignore / .ignore)
     let mut paths: Vec<PathBuf> = Vec::new();
 
     let walker = WalkBuilder::new(root)
-        .hidden(false)          // still respect gitignore rules for hidden dirs if configured
+        .hidden(false)
         .git_ignore(true)
         .git_global(true)
         .git_exclude(true)
@@ -142,9 +137,32 @@ pub fn scan(root: &Path) -> Vec<Finding> {
         }
     }
 
-    // Massive parallel scan (Rayon work-stealing – great on M4 Pro)
-    paths
+    let total = paths.len() as u64;
+
+    // Professional progress bar (works great under Rayon)
+    let pb = ProgressBar::new(total);
+    pb.set_style(
+        ProgressStyle::with_template(
+            "{spinner:.cyan} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} files ({eta}) {msg}",
+        )
+        .unwrap()
+        .progress_chars("█▉▊▋▌▍▎▏  ")
+        .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+    );
+    pb.enable_steady_tick(Duration::from_millis(80));
+    pb.set_message("scanning…");
+
+    // Massive parallel scan (Rayon work-stealing – optimised for M4 Pro)
+    let findings: Vec<Finding> = paths
         .into_par_iter()
-        .flat_map(|path| scan_file(&path, rules))
-        .collect()
+        .flat_map(|path| {
+            let result = scan_file(&path, rules);
+            pb.inc(1);
+            result
+        })
+        .collect();
+
+    pb.finish_and_clear(); // clean terminal after scan
+
+    findings
 }
