@@ -2,6 +2,7 @@
 //! Author: 0xBrdn
 
 mod rules;
+mod scanner;
 
 use clap::{Parser, Subcommand};
 use colored::Colorize;
@@ -32,17 +33,32 @@ enum Commands {
 fn main() {
     let cli = Cli::parse();
 
-    // Rules are compiled once via OnceLock
-    let rules = rules::get_rules();
-
     match cli.command {
         Commands::Scan { path } => {
             println!(
-                "{} Scanning path: {} ({} rules loaded)",
+                "{} Scanning path: {}",
                 "[DEBUG]".yellow().bold(),
-                path.display().to_string().cyan(),
-                rules.len().to_string().green()
+                path.display().to_string().cyan()
             );
+
+            let findings = scanner::scan(&path);
+
+            println!(
+                "{} Found {} potential secret(s)",
+                "[DEBUG]".yellow().bold(),
+                findings.len().to_string().green()
+            );
+
+            for f in &findings {
+                println!(
+                    "  {} {}:{}  [{}]  {}",
+                    "→".red(),
+                    f.file.display(),
+                    f.line,
+                    f.rule_name.yellow(),
+                    f.secret_obfuscated.bright_black()
+                );
+            }
         }
         Commands::InstallHook => {
             println!(
