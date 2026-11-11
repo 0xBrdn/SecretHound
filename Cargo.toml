@@ -1,6 +1,6 @@
 [package]
 name = "secrethound"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 authors = ["0xBrdn"]
 description = "Ultra-fast static secrets scanner written in Rust"
