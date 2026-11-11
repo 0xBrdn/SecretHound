@@ -17,7 +17,7 @@ use std::process::{self, Command};
 #[derive(Parser)]
 #[command(name = "secrethound")]
 #[command(author = "0xBrdn")]
-#[command(version = "0.2.0")]
+#[command(version = "0.3.0")]
 #[command(about = "Ultra-fast static secrets scanner", long_about = None)]
 struct Cli {
     #[command(subcommand)]
@@ -30,6 +30,8 @@ enum OutputFormat {
     Text,
     /// Structured JSON for CI/CD
     Json,
+    /// SARIF 2.1.0 for GitHub Code Scanning / SAST tools
+    Sarif,
 }
 
 #[derive(Subcommand)]
@@ -48,6 +50,8 @@ enum Commands {
     InstallHook,
 }
 
+// ── JSON report ──────────────────────────────────────────────────────────────
+
 #[derive(Serialize)]
 struct JsonReport {
     tool: &'static str,
@@ -62,6 +66,82 @@ struct JsonFinding {
     line: usize,
     rule: &'static str,
     secret_obfuscated: String,
+}
+
+// ── SARIF 2.1.0 (minimal but valid subset) ───────────────────────────────────
+
+#[derive(Serialize)]
+struct SarifLog {
+    #[serde(rename = "$schema")]
+    schema: &'static str,
+    version: &'static str,
+    runs: Vec<SarifRun>,
+}
+
+#[derive(Serialize)]
+struct SarifRun {
+    tool: SarifTool,
+    results: Vec<SarifResult>,
+}
+
+#[derive(Serialize)]
+struct SarifTool {
+    driver: SarifDriver,
+}
+
+#[derive(Serialize)]
+struct SarifDriver {
+    name: &'static str,
+    information_uri: &'static str,
+    version: &'static str,
+    rules: Vec<SarifRule>,
+}
+
+#[derive(Serialize)]
+struct SarifRule {
+    id: String,
+    short_description: SarifMessage,
+    full_description: SarifMessage,
+    default_configuration: SarifDefaultConfig,
+}
+
+#[derive(Serialize)]
+struct SarifMessage {
+    text: String,
+}
+
+#[derive(Serialize)]
+struct SarifDefaultConfig {
+    level: &'static str,
+}
+
+#[derive(Serialize)]
+struct SarifResult {
+    rule_id: String,
+    level: &'static str,
+    message: SarifMessage,
+    locations: Vec<SarifLocation>,
+}
+
+#[derive(Serialize)]
+struct SarifLocation {
+    physical_location: SarifPhysicalLocation,
+}
+
+#[derive(Serialize)]
+struct SarifPhysicalLocation {
+    artifact_location: SarifArtifactLocation,
+    region: SarifRegion,
+}
+
+#[derive(Serialize)]
+struct SarifArtifactLocation {
+    uri: String,
+}
+
+#[derive(Serialize)]
+struct SarifRegion {
+    start_line: usize,
 }
 
 fn print_findings_table(findings: &[scanner::Finding]) {
@@ -105,7 +185,7 @@ fn print_findings_table(findings: &[scanner::Finding]) {
 fn emit_json(findings: &[scanner::Finding]) {
     let report = JsonReport {
         tool: "secrethound",
-        version: "0.2.0",
+        version: "0.3.0",
         findings_count: findings.len(),
         findings: findings
             .iter()
@@ -118,11 +198,82 @@ fn emit_json(findings: &[scanner::Finding]) {
             .collect(),
     };
 
-    // Pure JSON on stdout (CI-friendly)
     match serde_json::to_string_pretty(&report) {
         Ok(json) => println!("{}", json),
         Err(e) => {
             eprintln!("Failed to serialize JSON report: {}", e);
+            process::exit(2);
+        }
+    }
+}
+
+fn emit_sarif(findings: &[scanner::Finding]) {
+    // Collect unique rule ids present in the findings
+    let mut rule_ids: Vec<&str> = findings.iter().map(|f| f.rule_name).collect();
+    rule_ids.sort_unstable();
+    rule_ids.dedup();
+
+    let rules: Vec<SarifRule> = rule_ids
+        .iter()
+        .map(|id| SarifRule {
+            id: id.to_string(),
+            short_description: SarifMessage {
+                text: format!("Secret detected by rule '{}'", id),
+            },
+            full_description: SarifMessage {
+                text: format!(
+                    "SecretHound rule '{}' matched a potential credential or secret.",
+                    id
+                ),
+            },
+            default_configuration: SarifDefaultConfig { level: "error" },
+        })
+        .collect();
+
+    let results: Vec<SarifResult> = findings
+        .iter()
+        .map(|f| SarifResult {
+            rule_id: f.rule_name.to_string(),
+            level: "error",
+            message: SarifMessage {
+                text: format!(
+                    "Potential secret ({}) found: {}",
+                    f.rule_name, f.secret_obfuscated
+                ),
+            },
+            locations: vec![SarifLocation {
+                physical_location: SarifPhysicalLocation {
+                    artifact_location: SarifArtifactLocation {
+                        uri: f.file.display().to_string(),
+                    },
+                    region: SarifRegion {
+                        start_line: f.line,
+                    },
+                },
+            }],
+        })
+        .collect();
+
+    let log = SarifLog {
+        schema: "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+        version: "2.1.0",
+        runs: vec![SarifRun {
+            tool: SarifTool {
+                driver: SarifDriver {
+                    name: "SecretHound",
+                    information_uri: "https://github.com/0xBrdn/secrethound",
+                    version: "0.3.0",
+                    rules,
+                },
+            },
+            results,
+        }],
+    };
+
+    match serde_json::to_string_pretty(&log) {
+        Ok(json) => println!("{}", json),
+        Err(e) => {
+            eprintln!("Failed to serialize SARIF report: {}", e);
             process::exit(2);
         }
     }
@@ -232,7 +383,7 @@ fn main() {
 
     match cli.command {
         Commands::Scan { path, format } => {
-            let quiet = matches!(format, OutputFormat::Json);
+            let quiet = matches!(format, OutputFormat::Json | OutputFormat::Sarif);
 
             if !quiet {
                 println!();
@@ -249,6 +400,10 @@ fn main() {
             match format {
                 OutputFormat::Json => {
                     emit_json(&findings);
+                    process::exit(if findings.is_empty() { 0 } else { 1 });
+                }
+                OutputFormat::Sarif => {
+                    emit_sarif(&findings);
                     process::exit(if findings.is_empty() { 0 } else { 1 });
                 }
                 OutputFormat::Text => {
