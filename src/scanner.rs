@@ -24,6 +24,7 @@ pub struct Finding {
     /// Partially obfuscated secret (e.g. AKIA********1234)
     pub secret_obfuscated: String,
     /// Original secret (kept internal / for allowlist matching, not serialized by default)
+    #[allow(dead_code)]
     #[serde(skip)]
     pub secret_raw: String,
 }
