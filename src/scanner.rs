@@ -5,13 +5,15 @@ use crate::rules::{get_rules, SecretRule};
 use ignore::WalkBuilder;
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
+use serde::Serialize;
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// A single secret finding.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Finding {
     /// Absolute or relative path of the file
     pub file: PathBuf,
@@ -21,10 +23,68 @@ pub struct Finding {
     pub rule_name: &'static str,
     /// Partially obfuscated secret (e.g. AKIA********1234)
     pub secret_obfuscated: String,
+    /// Original secret (kept internal / for allowlist matching, not serialized by default)
+    #[serde(skip)]
+    pub secret_raw: String,
+}
+
+/// Allowlist loaded from `.secrethoundignore`.
+#[derive(Debug, Default)]
+pub struct Allowlist {
+    /// Path prefixes / exact paths to skip entirely
+    pub ignored_paths: Vec<String>,
+    /// Exact secrets (raw) that are accepted as false positives
+    pub allowed_secrets: HashSet<String>,
+}
+
+impl Allowlist {
+    /// Load `.secrethoundignore` from the given root directory.
+    /// Format:
+    ///   # comment
+    ///   path/to/ignore          → skip this path (prefix match)
+    ///   ignore SECRET_VALUE     → allow this exact secret
+    pub fn load(root: &Path) -> Self {
+        let path = root.join(".secrethoundignore");
+        let mut allowlist = Allowlist::default();
+
+        let file = match File::open(&path) {
+            Ok(f) => f,
+            Err(_) => return allowlist,
+        };
+
+        let reader = BufReader::new(file);
+        for line in reader.lines().flatten() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+
+            if let Some(secret) = line.strip_prefix("ignore ") {
+                let secret = secret.trim();
+                if !secret.is_empty() {
+                    allowlist.allowed_secrets.insert(secret.to_string());
+                }
+            } else {
+                // Treat as path/prefix to ignore
+                allowlist.ignored_paths.push(line.to_string());
+            }
+        }
+
+        allowlist
+    }
+
+    fn is_path_ignored(&self, path: &Path) -> bool {
+        let path_str = path.to_string_lossy();
+        self.ignored_paths.iter().any(|p| path_str.contains(p))
+    }
+
+    fn is_secret_allowed(&self, secret: &str) -> bool {
+        self.allowed_secrets.contains(secret)
+    }
 }
 
 /// Obfuscate a secret: keep first 4 and last 4 characters, mask the middle.
-fn obfuscate(secret: &str) -> String {
+pub fn obfuscate(secret: &str) -> String {
     let chars: Vec<char> = secret.chars().collect();
     let len = chars.len();
 
@@ -60,8 +120,8 @@ fn is_likely_binary(path: &Path) -> bool {
 }
 
 /// Scan a single file for secrets. Returns findings or empty vec on error / binary.
-fn scan_file(path: &Path, rules: &[SecretRule]) -> Vec<Finding> {
-    if is_likely_binary(path) {
+fn scan_file(path: &Path, rules: &[SecretRule], allowlist: &Allowlist) -> Vec<Finding> {
+    if is_likely_binary(path) || allowlist.is_path_ignored(path) {
         return Vec::new();
     }
 
@@ -94,7 +154,7 @@ fn scan_file(path: &Path, rules: &[SecretRule]) -> Vec<Finding> {
                     continue;
                 };
 
-                if secret.is_empty() {
+                if secret.is_empty() || allowlist.is_secret_allowed(secret) {
                     continue;
                 }
 
@@ -103,6 +163,7 @@ fn scan_file(path: &Path, rules: &[SecretRule]) -> Vec<Finding> {
                     line: line_no,
                     rule_name: rule.name,
                     secret_obfuscated: obfuscate(secret),
+                    secret_raw: secret.to_string(),
                 });
             }
         }
@@ -112,8 +173,10 @@ fn scan_file(path: &Path, rules: &[SecretRule]) -> Vec<Finding> {
 }
 
 /// Walk `root` with the `ignore` crate then scan in parallel with a live progress bar.
-pub fn scan(root: &Path) -> Vec<Finding> {
+/// Progress is written to stderr so that `--format json` can keep stdout clean.
+pub fn scan(root: &Path, quiet: bool) -> Vec<Finding> {
     let rules = get_rules();
+    let allowlist = Allowlist::load(root);
 
     // Collect candidate files (respects .gitignore / .ignore)
     let mut paths: Vec<PathBuf> = Vec::new();
@@ -139,30 +202,74 @@ pub fn scan(root: &Path) -> Vec<Finding> {
 
     let total = paths.len() as u64;
 
-    // Professional progress bar (works great under Rayon)
-    let pb = ProgressBar::new(total);
-    pb.set_style(
-        ProgressStyle::with_template(
-            "{spinner:.cyan} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} files ({eta}) {msg}",
-        )
-        .unwrap()
-        .progress_chars("█▉▊▋▌▍▎▏  ")
-        .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
-    );
-    pb.enable_steady_tick(Duration::from_millis(80));
-    pb.set_message("scanning…");
+    let pb = if quiet {
+        ProgressBar::hidden()
+    } else {
+        let pb = ProgressBar::new(total);
+        pb.set_style(
+            ProgressStyle::with_template(
+                "{spinner:.cyan} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} files ({eta}) {msg}",
+            )
+            .unwrap()
+            .progress_chars("█▉▊▋▌▍▎▏  ")
+            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+        );
+        pb.enable_steady_tick(Duration::from_millis(80));
+        pb.set_message("scanning…");
+        pb
+    };
 
     // Massive parallel scan (Rayon work-stealing – optimised for M4 Pro)
     let findings: Vec<Finding> = paths
         .into_par_iter()
         .flat_map(|path| {
-            let result = scan_file(&path, rules);
+            let result = scan_file(&path, rules, &allowlist);
             pb.inc(1);
             result
         })
         .collect();
 
-    pb.finish_and_clear(); // clean terminal after scan
+    if !quiet {
+        pb.finish_and_clear();
+    }
 
     findings
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn obfuscate_long_secret() {
+        let secret = "AKIAIOSFODNN7EXAMPLE";
+        let obf = obfuscate(secret);
+        assert!(obf.starts_with("AKIA"));
+        assert!(obf.ends_with("MPLE"));
+        assert!(obf.contains('*'));
+        assert_eq!(obf.len(), secret.len());
+    }
+
+    #[test]
+    fn obfuscate_short_secret() {
+        let secret = "short";
+        let obf = obfuscate(secret);
+        assert_eq!(obf, "s****");
+    }
+
+    #[test]
+    fn obfuscate_empty() {
+        assert_eq!(obfuscate(""), "");
+    }
+
+    #[test]
+    fn allowlist_path_and_secret() {
+        let mut al = Allowlist::default();
+        al.ignored_paths.push("fixtures/".to_string());
+        al.allowed_secrets.insert("AKIAIOSFODNN7EXAMPLE".to_string());
+
+        assert!(al.is_path_ignored(Path::new("src/fixtures/test.txt")));
+        assert!(al.is_secret_allowed("AKIAIOSFODNN7EXAMPLE"));
+        assert!(!al.is_secret_allowed("AKIAOTHERKEY123456"));
+    }
 }

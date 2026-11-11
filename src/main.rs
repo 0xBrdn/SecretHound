@@ -4,9 +4,10 @@
 mod rules;
 mod scanner;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use colored::Colorize;
 use comfy_table::{Attribute, Cell, Color, ContentArrangement, Table};
+use serde::Serialize;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
@@ -16,11 +17,19 @@ use std::process::{self, Command};
 #[derive(Parser)]
 #[command(name = "secrethound")]
 #[command(author = "0xBrdn")]
-#[command(version = "0.1.0")]
+#[command(version = "0.2.0")]
 #[command(about = "Ultra-fast static secrets scanner", long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+}
+
+#[derive(Clone, ValueEnum)]
+enum OutputFormat {
+    /// Human-readable table (default)
+    Text,
+    /// Structured JSON for CI/CD
+    Json,
 }
 
 #[derive(Subcommand)]
@@ -30,9 +39,29 @@ enum Commands {
         /// Path to scan (file or directory)
         #[arg(value_name = "PATH")]
         path: PathBuf,
+
+        /// Output format
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        format: OutputFormat,
     },
     /// Install the pre-commit git hook
     InstallHook,
+}
+
+#[derive(Serialize)]
+struct JsonReport {
+    tool: &'static str,
+    version: &'static str,
+    findings_count: usize,
+    findings: Vec<JsonFinding>,
+}
+
+#[derive(Serialize)]
+struct JsonFinding {
+    file: String,
+    line: usize,
+    rule: &'static str,
+    secret_obfuscated: String,
 }
 
 fn print_findings_table(findings: &[scanner::Finding]) {
@@ -73,6 +102,32 @@ fn print_findings_table(findings: &[scanner::Finding]) {
     );
 }
 
+fn emit_json(findings: &[scanner::Finding]) {
+    let report = JsonReport {
+        tool: "secrethound",
+        version: "0.2.0",
+        findings_count: findings.len(),
+        findings: findings
+            .iter()
+            .map(|f| JsonFinding {
+                file: f.file.display().to_string(),
+                line: f.line,
+                rule: f.rule_name,
+                secret_obfuscated: f.secret_obfuscated.clone(),
+            })
+            .collect(),
+    };
+
+    // Pure JSON on stdout (CI-friendly)
+    match serde_json::to_string_pretty(&report) {
+        Ok(json) => println!("{}", json),
+        Err(e) => {
+            eprintln!("Failed to serialize JSON report: {}", e);
+            process::exit(2);
+        }
+    }
+}
+
 /// Resolve the .git directory (works from any subdirectory of a repo).
 fn find_git_dir() -> Result<PathBuf, String> {
     let output = Command::new("git")
@@ -89,7 +144,6 @@ fn find_git_dir() -> Result<PathBuf, String> {
     let git_dir = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let path = PathBuf::from(git_dir);
 
-    // Make absolute if relative
     if path.is_relative() {
         let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
         Ok(cwd.join(path))
@@ -104,10 +158,8 @@ fn install_hook() -> Result<(), String> {
     let hooks_dir = git_dir.join("hooks");
     let hook_path = hooks_dir.join("pre-commit");
 
-    // Ensure hooks directory exists
     fs::create_dir_all(&hooks_dir).map_err(|e| format!("Cannot create hooks dir: {}", e))?;
 
-    // Resolve the absolute path of the current secrethound binary
     let exe = std::env::current_exe()
         .map_err(|e| format!("Cannot resolve current executable: {}", e))?;
     let exe_str = exe.to_string_lossy();
@@ -120,13 +172,12 @@ fn install_hook() -> Result<(), String> {
 
 set -e
 
-echo "▸ SecretHound · pre-commit scan…"
+echo "SecretHound · pre-commit scan…"
 "{exe_str}" scan .
 
 "#
     );
 
-    // If a pre-commit already exists, check whether we already installed our hook
     if hook_path.exists() {
         let existing = fs::read_to_string(&hook_path).unwrap_or_default();
         if existing.contains("SecretHound pre-commit hook") {
@@ -138,7 +189,6 @@ echo "▸ SecretHound · pre-commit scan…"
             return Ok(());
         }
 
-        // Append our block so we don't destroy a custom hook
         let mut file = OpenOptions::new()
             .append(true)
             .open(&hook_path)
@@ -155,13 +205,9 @@ echo "▸ SecretHound · pre-commit scan…"
     } else {
         fs::write(&hook_path, hook_content)
             .map_err(|e| format!("Cannot write hook file: {}", e))?;
-        println!(
-            "{}  Created new pre-commit hook.",
-            "✔".green().bold()
-        );
+        println!("{}  Created new pre-commit hook.", "✔".green().bold());
     }
 
-    // Make executable (chmod +x)
     let mut perms = fs::metadata(&hook_path)
         .map_err(|e| e.to_string())?
         .permissions();
@@ -175,9 +221,7 @@ echo "▸ SecretHound · pre-commit scan…"
         "{}  The hook will now run automatically on every `git commit`.",
         "ℹ".cyan()
     );
-    println!(
-        "    If secrets are detected, the commit will be blocked (exit code 1)."
-    );
+    println!("    If secrets are detected, the commit will be blocked (exit code 1).");
     println!();
 
     Ok(())
@@ -187,28 +231,39 @@ fn main() {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Scan { path } => {
-            println!();
-            println!(
-                "{}  SecretHound · scanning {}",
-                "▸".cyan().bold(),
-                path.display().to_string().bold()
-            );
-            println!();
+        Commands::Scan { path, format } => {
+            let quiet = matches!(format, OutputFormat::Json);
 
-            let findings = scanner::scan(&path);
-
-            if findings.is_empty() {
+            if !quiet {
+                println!();
                 println!(
-                    "{}  No secrets found. Repository looks clean.",
-                    "✔".green().bold()
+                    "{}  SecretHound · scanning {}",
+                    "▸".cyan().bold(),
+                    path.display().to_string().bold()
                 );
                 println!();
-                process::exit(0);
-            } else {
-                print_findings_table(&findings);
-                // Non-zero exit → blocks git commit when used as a hook
-                process::exit(1);
+            }
+
+            let findings = scanner::scan(&path, quiet);
+
+            match format {
+                OutputFormat::Json => {
+                    emit_json(&findings);
+                    process::exit(if findings.is_empty() { 0 } else { 1 });
+                }
+                OutputFormat::Text => {
+                    if findings.is_empty() {
+                        println!(
+                            "{}  No secrets found. Repository looks clean.",
+                            "✔".green().bold()
+                        );
+                        println!();
+                        process::exit(0);
+                    } else {
+                        print_findings_table(&findings);
+                        process::exit(1);
+                    }
+                }
             }
         }
         Commands::InstallHook => {
