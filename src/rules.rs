@@ -10,6 +10,7 @@ pub struct SecretRule {
     /// Short identifier (e.g. "aws-access-key")
     pub name: &'static str,
     /// Human-readable description
+    #[allow(dead_code)]
     pub description: &'static str,
     /// Compiled regular expression
     pub regex: Regex,
@@ -33,7 +34,7 @@ pub fn get_rules() -> &'static [SecretRule] {
                 name: "aws-secret-access-key",
                 description: "AWS Secret Access Key",
                 regex: Regex::new(
-                    r"(?i)(?:aws)?[_\-\s]?(?:secret)?[_\-\s]?(?:access)?[_\-\s]?key[_\-\s]*(?:=|:)\s*['\"]?([A-Za-z0-9/+=]{40})['\"]?",
+                    r#"(?i)(?:aws)?[_\-\s]?(?:secret)?[_\-\s]?(?:access)?[_\-\s]?key[_\-\s]*(?:=|:)\s*['"]?([A-Za-z0-9/+=]{40})['"]?"#,
                 )
                 .expect("invalid AWS Secret Access Key regex"),
             },
@@ -54,7 +55,7 @@ pub fn get_rules() -> &'static [SecretRule] {
             // 5. Password embedded in URL (user:pass@host)
             SecretRule {
                 name: "url-password",
-                description: "Password embedded in URL (e.g. amqp://user:pass@host)",
+                description: "Credentials embedded inside a URL",
                 regex: Regex::new(r"(?i)(?:[a-z][a-z0-9+.-]*)://[^:\s/]+:([^@\s/]+)@")
                     .expect("invalid URL password regex"),
             },
@@ -126,7 +127,7 @@ mod tests {
             .find(|r| r.name == "url-password")
             .expect("url-password rule missing");
 
-        let sample = "amqp://admin:s3cr3tP@ss@rabbitmq.internal:5672";
+        let sample = "amqp://admin:s3cr3tPass@rabbitmq.internal:5672";
         assert!(rule.regex.is_match(sample));
     }
 }
